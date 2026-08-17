@@ -67,6 +67,3 @@ responsive-audit/
 
 ---
 
-## License
-
-MIT
