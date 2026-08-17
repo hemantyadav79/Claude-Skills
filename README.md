@@ -54,6 +54,31 @@ responsive-audit/
 
 ### Audit Phases
 
+#### Workflow Architecture
+
+```mermaid
+flowchart TD
+    Start([User Invokes Skill]) --> Agent[Antigravity Agent]
+    Agent --> Skill{responsive-audit}
+    
+    subgraph Code["Static Analysis"]
+        Skill --> P1[Phase 1: Code Analysis]
+    end
+    
+    subgraph Browser["Puppeteer Automation"]
+        Skill --> P0[Phase 0: Pre-Flight]
+        P0 --> P2[Phase 2: Breakpoints]
+        P2 --> P3[Phase 3: Multi-Page]
+        P3 --> P4[Phase 4: Broken Links]
+        P4 --> P5[Phase 5: Themes]
+        P5 --> P6[Phase 6: Accessibility]
+    end
+    
+    P1 --> Report
+    P6 --> Report[Phase 7: Report Generation]
+    Report --> End([Actionable Findings])
+```
+
 | Phase | What it does |
 |---|---|
 | 0. Pre-Flight | Verifies URL, detects tech stack & project structure |
