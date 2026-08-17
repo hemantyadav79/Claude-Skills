@@ -1,4 +1,4 @@
-# Claude Skills
+# Skills For Testing Responsiveness of the UI/UX
 
 A collection of AI agent skills for automated development workflows.
 
