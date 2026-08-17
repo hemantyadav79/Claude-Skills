@@ -20,7 +20,11 @@ const colors = {
   blue: '\x1b[34m',
   magenta: '\x1b[35m',
   cyan: '\x1b[36m',
-  gray: '\x1b[90m'
+  gray: '\x1b[90m',
+  bgRed: '\x1b[41m',
+  bgGreen: '\x1b[42m',
+  bgYellow: '\x1b[43m',
+  white: '\x1b[37m'
 };
 
 // --- Default Configuration ---
@@ -33,8 +37,39 @@ const DEFAULT_CONFIG = {
   themeMethod: 'auto', // 'media' | 'class:dark' | 'attr:data-theme=dark' | 'auto'
   checkLinks: true,
   externalLinks: false,
-  timeout: 30000
+  timeout: 30000,
+  noSandbox: false,
+  ignoreHttpsErrors: false,
+  globalTimeout: 300000
 };
+
+// --- Security Helpers ---
+function isBlockedUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    const hostname = u.hostname;
+    const blocked = ['169.254.169.254', 'metadata.google.internal', 'metadata.google.com', '0.0.0.0'];
+    if (blocked.includes(hostname)) return true;
+    return false;
+  } catch (e) {
+    return true; // Block invalid URLs
+  }
+}
+
+const fetchTimes = new Map();
+async function throttledFetch(url, options) {
+  const hostname = new URL(url).hostname;
+  const now = Date.now();
+  const lastFetch = fetchTimes.get(hostname) || 0;
+  const timeSinceLastFetch = now - lastFetch;
+  
+  if (timeSinceLastFetch < 200) {
+    await new Promise(r => setTimeout(r, 200 - timeSinceLastFetch));
+  }
+  
+  fetchTimes.set(hostname, Date.now());
+  return fetch(url, options);
+}
 
 // --- CLI Parsing ---
 function parseArgs() {
@@ -47,20 +82,33 @@ function parseArgs() {
   const config = { ...DEFAULT_CONFIG, targetUrl: args[0] };
 
   try {
-    new URL(config.targetUrl);
+    const url = new URL(config.targetUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error(`Unsupported protocol: ${url.protocol}`);
+    }
   } catch (e) {
-    console.error(`${colors.red}Error: Invalid target URL "${config.targetUrl}"${colors.reset}`);
+    console.error(`${colors.red}Error: Invalid or unsupported target URL "${config.targetUrl}"${colors.reset}`);
     process.exit(1);
   }
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--breakpoints') {
-      config.breakpoints = args[++i].split(',').map(Number).filter(n => !isNaN(n));
+      config.breakpoints = args[++i].split(',')
+        .map(Number)
+        .filter(n => !isNaN(n) && n >= 200 && n <= 7680);
     } else if (arg === '--pages') {
-      config.pages = args[++i].split(',').map(p => p.trim());
+      config.pages = args[++i].split(',')
+        .map(p => p.trim())
+        .filter(p => p.startsWith('/') && !p.includes('..') && /^[a-zA-Z0-9/\-_.]+$/.test(p));
     } else if (arg === '--output') {
-      config.output = args[++i];
+      const outPath = path.resolve(args[++i]);
+      const relative = path.relative(process.cwd(), outPath);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) {
+         console.error(`${colors.red}Error: Output path must be within the current working directory.${colors.reset}`);
+         process.exit(1);
+      }
+      config.output = outPath;
     } else if (arg === '--full-page') {
       config.fullPage = args[++i] !== 'false';
     } else if (arg === '--theme') {
@@ -74,6 +122,12 @@ function parseArgs() {
       if (args[i] !== undefined && args[i].startsWith('--')) i--; 
     } else if (arg === '--timeout') {
       config.timeout = parseInt(args[++i], 10) || 30000;
+    } else if (arg === '--no-sandbox') {
+      config.noSandbox = true;
+    } else if (arg === '--ignore-https-errors') {
+      config.ignoreHttpsErrors = true;
+    } else if (arg === '--global-timeout') {
+      config.globalTimeout = parseInt(args[++i], 10) || 300000;
     }
   }
 
@@ -99,6 +153,9 @@ ${colors.bold}Options:${colors.reset}
   --check-links          Check all links for broken URLs (default: true)
   --external-links       Also check external URLs, not just internal (default: false)
   --timeout <ms>         Page load timeout (default: 30000)
+  --no-sandbox           Disable Chromium sandbox (use only in CI/Docker) (default: false)
+  --ignore-https-errors  Accept self-signed SSL certificates (default: false)
+  --global-timeout <ms>  Maximum total audit duration in ms (default: 300000)
 `);
 }
 
@@ -123,9 +180,21 @@ async function ensureDir(dir) {
 }
 
 // --- Browser Execution Scripts ---
-// The following functions are executed INSIDE the Puppeteer page context.
+const safeElementIdFunc = `
+function safeElementId(el) {
+  if (!el || !el.tagName) return '<unknown>';
+  let str = '<' + el.tagName.toLowerCase();
+  if (el.id) str += '#' + el.id;
+  if (el.className && typeof el.className === 'string') {
+    const classes = el.className.trim().split(/\\s+/).filter(Boolean);
+    if (classes.length > 0) str += '.' + classes.join('.');
+  }
+  return str + '>';
+}
+`;
 
 const layoutCheckScript = `() => {
+  ${safeElementIdFunc}
   const issues = [];
   const report = (type, severity, description, element, details, suggestion) => {
     issues.push({ type, severity, description, element, details, suggestion });
@@ -150,7 +219,7 @@ const layoutCheckScript = `() => {
       const rect = el.getBoundingClientRect();
       if (rect.right > docClientWidth && rect.width > 0) {
         report('overflow-culprit', 'warning', 'Element overflows viewport horizontally.', 
-               el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.className ? '.' + el.className.split(' ').join('.') : ''),
+               safeElementId(el),
                { rectRight: rect.right, viewportWidth: docClientWidth },
                'Use max-width: 100% or overflow-wrap: break-word.'
         );
@@ -168,7 +237,7 @@ const layoutCheckScript = `() => {
         'small-touch-target',
         'warning',
         'Interactive element is smaller than 44x44px (WCAG minimum).',
-        el.outerHTML.substring(0, 100),
+        safeElementId(el),
         { width: rect.width, height: rect.height },
         'Increase padding or min-width/min-height to at least 44px.'
       );
@@ -205,7 +274,7 @@ const layoutCheckScript = `() => {
             'small-font-size',
             'warning',
             'Font size is smaller than 12px, which may be hard to read.',
-            node.outerHTML.substring(0, 100),
+            safeElementId(node),
             { fontSize },
             'Increase font-size to at least 12px (16px is recommended for body text).'
           );
@@ -220,7 +289,7 @@ const layoutCheckScript = `() => {
           'text-truncation',
           'info',
           'Text is truncated with an ellipsis.',
-          node.outerHTML.substring(0, 100),
+          safeElementId(node),
           { scrollWidth: node.scrollWidth, clientWidth: node.clientWidth, text: node.textContent.trim().substring(0, 30) },
           'Ensure truncated text is accessible (e.g., via title attribute or tooltip).'
         );
@@ -236,7 +305,7 @@ const layoutCheckScript = `() => {
         'broken-image',
         'critical',
         'Image failed to load or is broken.',
-        img.outerHTML.substring(0, 100),
+        safeElementId(img),
         { src: img.src },
         'Verify the image URL and ensure the asset exists.'
       );
@@ -247,7 +316,7 @@ const layoutCheckScript = `() => {
           'oversized-image',
           'warning',
           'Image is wider than the viewport.',
-          img.outerHTML.substring(0, 100),
+          safeElementId(img),
           { imgWidth: rect.width, viewportWidth: docClientWidth },
           'Add max-width: 100% to the image.'
         );
@@ -259,6 +328,7 @@ const layoutCheckScript = `() => {
 }`;
 
 const contrastCheckScript = `() => {
+  ${safeElementIdFunc}
   const issues = [];
 
   function getLuminance(r, g, b) {
@@ -329,7 +399,7 @@ const contrastCheckScript = `() => {
 
     if (ratio < requiredRatio) {
       issues.push({
-        element: node.tagName.toLowerCase() + (node.className ? '.' + node.className.split(' ').join('.') : ''),
+        element: safeElementId(node),
         text: node.textContent.trim().substring(0, 30),
         foreground: colorStr,
         background: bgStr,
@@ -345,22 +415,23 @@ const contrastCheckScript = `() => {
 }`;
 
 const extractLinksScript = `() => {
+  ${safeElementIdFunc}
   const links = [];
   
   document.querySelectorAll('a[href]').forEach(a => {
-    links.push({ type: 'anchor', url: a.href, raw: a.getAttribute('href'), element: a.outerHTML.substring(0,100) });
+    links.push({ type: 'anchor', url: a.href, raw: a.getAttribute('href'), element: safeElementId(a) });
   });
   
   document.querySelectorAll('img[src]').forEach(img => {
-    links.push({ type: 'image', url: img.src, raw: img.getAttribute('src'), element: img.outerHTML.substring(0,100) });
+    links.push({ type: 'image', url: img.src, raw: img.getAttribute('src'), element: safeElementId(img) });
   });
   
   document.querySelectorAll('link[href]').forEach(link => {
-    links.push({ type: 'stylesheet', url: link.href, raw: link.getAttribute('href'), element: link.outerHTML.substring(0,100) });
+    links.push({ type: 'stylesheet', url: link.href, raw: link.getAttribute('href'), element: safeElementId(link) });
   });
 
   document.querySelectorAll('script[src]').forEach(script => {
-    links.push({ type: 'script', url: script.src, raw: script.getAttribute('src'), element: script.outerHTML.substring(0,100) });
+    links.push({ type: 'script', url: script.src, raw: script.getAttribute('src'), element: safeElementId(script) });
   });
 
   return links;
@@ -379,8 +450,6 @@ const toggleThemeScript = `async (theme, method) => {
     document.body.classList.remove('light', 'dark', 'theme-light', 'theme-dark', 'dark-mode');
     document.body.classList.add(theme === 'dark' ? 'dark' : 'light');
     
-    // Try to find a theme toggle button and click it if state doesn't match
-    // Note: This is heuristic and might not work for all sites, media query is usually better.
   } else if (method.startsWith('class:')) {
     const cls = method.split(':')[1];
     if (theme === 'dark') {
@@ -403,6 +472,17 @@ const toggleThemeScript = `async (theme, method) => {
 // --- Main Engine ---
 async function runAudit() {
   const config = parseArgs();
+
+  const globalTimeoutId = setTimeout(() => {
+    console.error(`${colors.red}Error: Global audit timeout of ${config.globalTimeout}ms reached. Exiting.${colors.reset}`);
+    process.exit(2);
+  }, config.globalTimeout);
+
+  if (isBlockedUrl(config.targetUrl)) {
+    console.error(`${colors.red}Error: Target URL points to a blocked hostname.${colors.reset}`);
+    process.exit(1);
+  }
+
   const report = {
     url: config.targetUrl,
     timestamp: new Date().toISOString(),
@@ -419,9 +499,15 @@ async function runAudit() {
   const screenshotsDir = path.join(config.output, 'screenshots');
   await ensureDir(screenshotsDir);
 
+  const browserArgs = [];
+  if (config.noSandbox) {
+    browserArgs.push('--no-sandbox', '--disable-setuid-sandbox');
+  }
+
   const browser = await puppeteer.launch({
     headless: "new",
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: browserArgs,
+    ignoreHTTPSErrors: config.ignoreHttpsErrors
   });
 
   try {
@@ -429,6 +515,12 @@ async function runAudit() {
 
     for (const pagePath of config.pages) {
       const fullUrl = new URL(pagePath, baseUrl).toString();
+      
+      if (isBlockedUrl(fullUrl)) {
+        console.error(`${colors.red}Blocked full URL: ${fullUrl}${colors.reset}`);
+        continue;
+      }
+      
       console.log(`${colors.blue}▶ Auditing Page: ${fullUrl}${colors.reset}`);
 
       const page = await browser.newPage();
@@ -514,14 +606,25 @@ async function runAudit() {
     }
 
   } catch (error) {
-    console.error(`${colors.red}Fatal Error during audit: ${error.stack}${colors.reset}`);
+    if (process.env.DEBUG) {
+      console.error(`${colors.red}Fatal Error during audit: ${error.stack}${colors.reset}`);
+    } else {
+      console.error(`${colors.red}Fatal Error during audit: ${error.message}${colors.reset}`);
+    }
   } finally {
+    clearTimeout(globalTimeoutId);
     await browser.close();
   }
 
   // Generate Report
   const reportPath = path.join(config.output, 'audit-report.json');
   await fs.writeFile(reportPath, JSON.stringify(report, null, 2));
+  
+  try {
+    await fs.chmod(reportPath, 0o600);
+  } catch (e) {
+    // Ignore chmod errors on Windows
+  }
 
   printSummary(report, reportPath);
 
@@ -546,10 +649,21 @@ async function performLinkAnalysis(links, baseUrl, config, report, page) {
   });
 
   let checkedCount = 0;
+  const MAX_LINKS_TO_CHECK = 200;
 
   for (const [linkUrl, linkData] of uniqueLinks.entries()) {
+    if (checkedCount >= MAX_LINKS_TO_CHECK) {
+      console.warn(`\n  ${colors.yellow}Warning: Reached maximum link check limit (${MAX_LINKS_TO_CHECK}). Skipping remaining links.${colors.reset}`);
+      break;
+    }
+
     report.summary.totalChecks++;
     
+    // Check SSRF
+    if (isBlockedUrl(linkUrl)) {
+      continue;
+    }
+
     // Check for empty/missing raw href
     if (!linkData.raw || linkData.raw.trim() === '') {
       report.linkIssues.push({
@@ -589,7 +703,7 @@ async function performLinkAnalysis(links, baseUrl, config, report, page) {
             status: null,
             severity: 'warning',
             type: 'broken-anchor',
-            suggestion: `Ensure an element with id="${id}" exists on the page.`
+            suggestion: \`Ensure an element with id="\${id}" exists on the page.\`
           });
           updateSummary(report, 'warning');
         } else {
@@ -617,7 +731,7 @@ async function performLinkAnalysis(links, baseUrl, config, report, page) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for links
       
-      const res = await fetch(linkUrl, { 
+      const res = await throttledFetch(linkUrl, { 
         method: 'HEAD',
         signal: controller.signal,
         headers: { 'User-Agent': 'Responsive-Audit-Bot/1.0' }
@@ -632,7 +746,7 @@ async function performLinkAnalysis(links, baseUrl, config, report, page) {
           status: res.status,
           severity: res.status >= 500 ? 'critical' : (res.status === 404 ? 'critical' : 'warning'),
           type: linkData.type === 'image' ? 'broken-image' : 'dead-link',
-          suggestion: `Link returned status ${res.status}. Verify the destination.`
+          suggestion: \`Link returned status \${res.status}. Verify the destination.\`
         });
         updateSummary(report, res.status >= 500 || res.status === 404 ? 'critical' : 'warning');
       } else {
@@ -645,7 +759,7 @@ async function performLinkAnalysis(links, baseUrl, config, report, page) {
         status: null,
         severity: 'warning',
         type: 'fetch-failed',
-        suggestion: `Network error or timeout: ${err.message}`
+        suggestion: 'Network error or timeout. Verify the URL is accessible and the server is running.'
       });
       updateSummary(report, 'warning');
     }
@@ -666,29 +780,29 @@ function updateSummary(report, severity) {
 
 // --- Output Formatting ---
 function printSummary(report, reportPath) {
-  console.log(`\n${colors.bold}=== Audit Summary ===${colors.reset}`);
-  console.log(`Target URL : ${report.url}`);
-  console.log(`Report JSON: ${reportPath}`);
+  console.log(\`\\n\${colors.bold}=== Audit Summary ===\${colors.reset}\`);
+  console.log(\`Target URL : \${report.url}\`);
+  console.log(\`Report JSON: \${reportPath}\`);
   
-  console.log(`\n${colors.bold}Issues Breakdown:${colors.reset}`);
-  console.log(`  Total Checks : ${report.summary.totalChecks}`);
-  console.log(`  Passed       : ${colors.green}${report.summary.passed}${colors.reset}`);
-  console.log(`  Critical     : ${report.summary.critical > 0 ? colors.red + report.summary.critical + colors.reset : '0'}`);
-  console.log(`  Warnings     : ${report.summary.warnings > 0 ? colors.yellow + report.summary.warnings + colors.reset : '0'}`);
-  console.log(`  Info         : ${colors.blue}${report.summary.info}${colors.reset}`);
+  console.log(\`\\n\${colors.bold}Issues Breakdown:\${colors.reset}\`);
+  console.log(\`  Total Checks : \${report.summary.totalChecks}\`);
+  console.log(\`  Passed       : \${colors.green}\${report.summary.passed}\${colors.reset}\`);
+  console.log(\`  Critical     : \${report.summary.critical > 0 ? colors.red + report.summary.critical + colors.reset : '0'}\`);
+  console.log(\`  Warnings     : \${report.summary.warnings > 0 ? colors.yellow + report.summary.warnings + colors.reset : '0'}\`);
+  console.log(\`  Info         : \${colors.blue}\${report.summary.info}\${colors.reset}\`);
   
   const layoutIssuesCount = report.breakpoints.reduce((sum, bp) => sum + bp.issues.length, 0);
-  console.log(`\n${colors.bold}Categories:${colors.reset}`);
-  console.log(`  Layout/Viewport : ${layoutIssuesCount} issues found`);
-  console.log(`  Contrast/A11y   : ${report.contrastIssues.length} issues found`);
-  console.log(`  Links/Assets    : ${report.linkIssues.length} issues found`);
+  console.log(\`\\n\${colors.bold}Categories:\${colors.reset}\`);
+  console.log(\`  Layout/Viewport : \${layoutIssuesCount} issues found\`);
+  console.log(\`  Contrast/A11y   : \${report.contrastIssues.length} issues found\`);
+  console.log(\`  Links/Assets    : \${report.linkIssues.length} issues found\`);
 
   if (report.summary.critical > 0) {
-    console.log(`\n${colors.bgRed}${colors.white} AUDIT FAILED ${colors.reset} - Found critical issues.`);
+    console.log(\`\\n\${colors.bgRed}\${colors.white} AUDIT FAILED \${colors.reset} - Found critical issues.\`);
   } else if (report.summary.warnings > 0) {
-    console.log(`\n${colors.bgYellow}${colors.white} AUDIT PASSED WITH WARNINGS ${colors.reset}`);
+    console.log(\`\\n\${colors.bgYellow}\${colors.white} AUDIT PASSED WITH WARNINGS \${colors.reset}\`);
   } else {
-    console.log(`\n${colors.bgGreen}${colors.white} AUDIT PASSED ${colors.reset}`);
+    console.log(\`\\n\${colors.bgGreen}\${colors.white} AUDIT PASSED \${colors.reset}\`);
   }
 }
 

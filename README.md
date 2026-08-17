@@ -17,6 +17,7 @@ A comprehensive responsive design audit skill that performs automated testing ac
 - **Accessibility**: Touch targets, font sizes, focus indicators
 - **Multi-Page**: Tests multiple routes in SPAs and MPAs
 - **Monorepo Support**: Intelligently scans only frontend code
+- **Security Hardened**: SSRF protection, input validation, sandboxed browser
 
 ### Quick Start
 
@@ -32,6 +33,10 @@ node responsive-audit/scripts/responsive-audit.js http://localhost:8000 \
 # Dark mode only
 node responsive-audit/scripts/responsive-audit.js http://localhost:5173 \
   --theme dark
+
+# With self-signed cert (staging environments)
+node responsive-audit/scripts/responsive-audit.js https://staging.myapp.com \
+  --ignore-https-errors
 ```
 
 ### Skill Structure
@@ -40,7 +45,7 @@ node responsive-audit/scripts/responsive-audit.js http://localhost:5173 \
 responsive-audit/
 ├── SKILL.md                   # Agent instructions (8 phases)
 ├── scripts/
-│   └── responsive-audit.js    # Puppeteer automation script
+│   └── responsive-audit.js    # Puppeteer automation script (security hardened)
 ├── references/
 │   └── breakpoints.md         # Device & breakpoint reference
 └── resources/
@@ -59,6 +64,23 @@ responsive-audit/
 | 5. Theme & Contrast | Light vs Dark WCAG contrast comparison |
 | 6. Accessibility | Touch targets, font sizes, focus, reflow |
 | 7. Report | Comprehensive Markdown report with screenshots |
+
+### Security
+
+The script includes security hardening:
+
+| Protection | Description |
+|---|---|
+| URL Scheme Restriction | Only `http://` and `https://` accepted |
+| SSRF Protection | Cloud metadata endpoints blocked |
+| Output Path Sanitization | Output stays within working directory |
+| Input Validation | Breakpoints bounded (200-7680px), paths sanitized |
+| Chromium Sandboxing | Enabled by default; `--no-sandbox` is opt-in |
+| Link Check Limit | Max 200 links per page |
+| Request Throttling | 200ms delay between requests to same host |
+| Data Sanitization | No raw HTML or stack traces in reports |
+| Global Timeout | 5-minute default prevents infinite hangs |
+| File Permissions | Reports written with owner-only access (0o600) |
 
 ### Requirements
 

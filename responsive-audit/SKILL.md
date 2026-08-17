@@ -22,7 +22,7 @@ screen sizes and themes.
 
 - **Node.js** (v18+) must be installed
 - **Puppeteer** will be auto-installed via `npx` on first run (~170 MB Chromium download)
-- The target app must be running and accessible via a URL
+- The target app must be running and accessible via a URL (http/https only)
 
 ---
 
@@ -120,11 +120,16 @@ Run the Puppeteer script to test the live app at each breakpoint.
 
 **Run the script:**
 ```bash
-npx -y puppeteer@latest node "<path-to-skill>/scripts/responsive-audit.js" <url> --output <output-dir>
+npx -y puppeteer@23 node "<path-to-skill>/scripts/responsive-audit.js" <url> --output <output-dir>
 ```
 
 > Replace `<path-to-skill>` with the absolute path to this skill directory.
 > Replace `<output-dir>` with a temporary directory for screenshots and the JSON report.
+
+**Additional CLI flags for security:**
+- `--no-sandbox` — Disable Chromium sandbox (use only in CI/Docker environments)
+- `--ignore-https-errors` — Accept self-signed SSL certificates
+- `--global-timeout <ms>` — Maximum total audit duration (default: 300000 = 5 min)
 
 **Breakpoints tested:**
 
@@ -274,6 +279,29 @@ Each issue in the report must include:
 - **Monorepo**: Code analysis scans only frontend packages
 - **CSS-in-JS**: Code analysis may not find inline styles; browser testing covers this
 - **Auth-protected pages**: Skip with info note
-- **Self-signed HTTPS**: Use `--ignore-https-errors` in Puppeteer
+- **Self-signed HTTPS**: Use `--ignore-https-errors` flag in the script
 - **Rate-limited external URLs**: Respect rate limits, report as Info
 - **No running server**: Ask the user to start their dev server first
+
+---
+
+## Security Considerations
+
+The audit script includes the following security hardening:
+
+| Protection | What it does |
+|---|---|
+| **URL scheme restriction** | Only `http://` and `https://` URLs are accepted |
+| **SSRF protection** | Cloud metadata endpoints (169.254.169.254, etc.) are blocked |
+| **Output path sanitization** | Output directory must stay within the working directory |
+| **Input validation** | Breakpoints bounded (200-7680px), page paths sanitized |
+| **Chromium sandboxing** | Sandbox enabled by default; `--no-sandbox` is opt-in only |
+| **Link check limit** | Maximum 200 links checked per page to prevent abuse |
+| **Request throttling** | 200ms delay between requests to same host |
+| **Data sanitization** | No raw outerHTML or error stack traces in reports |
+| **Global timeout** | 5-minute default timeout prevents infinite hangs |
+| **File permissions** | Report files written with owner-only permissions (0o600) |
+
+> **Note**: When auditing untrusted or external websites, always keep the Chromium
+> sandbox enabled (do NOT use `--no-sandbox`). The sandbox provides an important
+> security boundary against malicious page content.
